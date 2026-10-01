@@ -1,0 +1,1217 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index de5742d..114f7d4 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -20,7 +20,7 @@ logger = get_logger("isnaverse.api")
+ 
+ from app.dependencies import require_admin
+ from app.models.user import User
+-from app.routers import admin, admin_audit, analytics, api_keys, auth, code_registry, dashboard, employee_aliases, integrations, notifications, period_reports, profile, projects, reconciliation_alerts, registration, reports, roles, scheduler, ticket_parsing, tickets, tools
++from app.routers import admin, admin_audit, analytics, api_keys, auth, code_registry, dashboard, employee_aliases, integrations, notifications, period_reports, profile, projects, reconciliation_alerts, registration, reports, roles, scheduler, telegram, ticket_parsing, tickets, tools
+ from app.tracker import router as tracker_router
+ import app.models  # noqa: F401 — регистрирует все модели в mapper registry, см. models/__init__.py
+ import app.tracker.models  # noqa: F401 — отдельный пакет (docs/architecture-backend.md), не в models/__init__.py
+@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI):
+     logger.info("startup tasks dispatched: refresh_q19, refresh_smax")
+     yield
+     logger.info("isnaverse API shutting down")
++    await telegram.shutdown()
+ 
+ 
+ limiter = Limiter(key_func=get_remote_address)
+@@ -149,6 +150,7 @@ app.include_router(integrations.router)
+ app.include_router(admin_audit.router)
+ app.include_router(roles.router)
+ app.include_router(tracker_router)
++app.include_router(telegram.router)
+ 
+ 
+ # ── /docs, /openapi.json — вход по реальному API-ключу, схема ТОЛЬКО
+diff --git a/backend/app/routers/telegram.py b/backend/app/routers/telegram.py
+new file mode 100644
+index 0000000..c7a5a55
+--- /dev/null
++++ b/backend/app/routers/telegram.py
+@@ -0,0 +1,255 @@
++"""Telegram во вкладке Meridian (раздел «Telegram», право "telegram").
++
++Клиент — Telegram Web K (https://github.com/morethanwords/tweb, GPL-3.0), готовая
++сборка лежит во фронтенде (frontend/public/tg/ → раздаётся nginx'ом как /tg/).
++Адреса дата-центров в сборке переписаны (scripts/tg_patch.py) на этот же хост, поэтому
++браузер ходит только на Meridian, а сервер — к Telegram:
++
++  /tgws/{name}/{path}  (WS)   — wss://{name}.web.telegram.org/{path}
++  /tgws/{name}/{path}  (POST) — https://{name}.web.telegram.org/{path}
++
++Имена и пути — только из белого списка ниже: это не открытый прокси. MTProto
++шифруется в браузере, сервер гоняет байты как есть; сессия Telegram живёт в IndexedDB
++браузера пользователя и на сервере не хранится.
++
++Авторизация. Остальной API — JWT в заголовке Authorization (localStorage), но iframe,
++статика и WebSocket заголовок приложить не могут. Поэтому страница /telegram сначала
++делает POST /api/tg/session (обычный Bearer + право "telegram") и получает httpOnly-куку
++TG_COOKIE — отдельный короткий JWT со scope="tg". Её проверяют:
++  - GET /tg/auth — nginx auth_request перед раздачей статики /tg/;
++  - /tgws/... — сам прокси (WS дополнительно сверяет Origin с Host).
++DELETE /api/tg/session (выход из Meridian) стирает куку и шлёт Clear-Site-Data:
++"storage" — браузер удаляет IndexedDB/service worker, следующий человек на этом же ПК
++чужой Telegram не увидит.
++
++nginx: /api/tg/... приходит сюда как /tg/... (префикс /api обрезается), /tgws/...
++проксируется без обрезки — см. frontend/nginx.conf.
++"""
++from __future__ import annotations
++
++import asyncio
++from datetime import datetime, timedelta, timezone
++from urllib.parse import urlsplit
++
++import httpx
++import websockets
++from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
++from jose import JWTError, jwt
++from sqlalchemy.orm import Session
++
++from app.config import settings
++from app.database import get_db
++from app.dependencies import get_current_user
++from app.models.user import User
++from app.services.permissions import compute_effective_permissions
++from app.utils.logging import get_logger
++
++logger = get_logger("isnaverse.routers.telegram")
++router = APIRouter(tags=["telegram"])
++
++PERMISSION_KEY = "telegram"
++TG_COOKIE = "meridian_tg"
++TG_SCOPE = "tg"
++# Страница /telegram продлевает куку каждые 30 минут, пока открыта (см.
++# frontend/src/components/telegram/telegram-panel.tsx) — запас на сон ноутбука и т.п.
++TG_SESSION_HOURS = 12
++
++# Адреса DC — по tweb src/lib/mtproto/dcConfigurator.ts (App.suffix = 'K').
++# WebSocket: k + ws + dcId(1..5) + ('' | '-1' для download/upload).
++WS_NAMES = frozenset(f"kws{dc}{sfx}" for dc in range(1, 6) for sfx in ("", "-1"))
++WS_PATHS = frozenset({"apiws", "apiws_premium", "apiws_test", "apiws_test_premium"})
++# HTTPS-транспорт: sslSubdomains[dcId-1] + ('' | '-1').
++HTTP_NAMES = frozenset(
++    f"{n}{sfx}" for n in ("pluto", "venus", "aurora", "vesta", "flora") for sfx in ("", "-1")
++)
++HTTP_PATHS = frozenset({"apiw1", "apiw_test1"})
++MAX_HTTP_BODY = 2 * 1024 * 1024  # MTProto-запрос с частью файла (до 512 КБ) + запас
++
++# trust_env=True (по умолчанию) — подхватывает HTTPS_PROXY, если выход наружу через прокси.
++_http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
++
++
++# ── кука сессии ──────────────────────────────────────────────────────────────
++
++def _issue_token(user_id: int) -> str:
++    expire = datetime.now(timezone.utc) + timedelta(hours=TG_SESSION_HOURS)
++    return jwt.encode(
++        {"sub": str(user_id), "scope": TG_SCOPE, "exp": expire},
++        settings.app_secret_key,
++        algorithm="HS256",
++    )
++
++
++def user_id_from_cookie(raw: str | None) -> int | None:
++    """id пользователя из куки TG_COOKIE или None. Только подпись/срок/scope, без БД:
++    вызывается на каждый файл статики (auth_request) и каждый MTProto-POST. Права
++    проверяются при выдаче куки, а её срок ограничен TG_SESSION_HOURS."""
++    if not raw:
++        return None
++    try:
++        payload = jwt.decode(raw, settings.app_secret_key, algorithms=["HS256"])
++    except JWTError:
++        return None
++    if payload.get("scope") != TG_SCOPE:
++        # обычный access-токен Meridian (без scope) сюда не годится и наоборот
++        return None
++    try:
++        return int(payload["sub"])
++    except (KeyError, ValueError):
++        return None
++
++
++def _cookie_secure() -> bool:
++    return settings.app_env != "development"
++
++
++@router.post("/tg/session", status_code=204)
++def open_session(
++    response: Response,
++    user: User = Depends(get_current_user),
++    db: Session = Depends(get_db),
++):
++    """Выдать куку для /tg/ и /tgws/ (вызывается страницей /telegram при открытии и
++    периодически, пока она открыта)."""
++    if not user.profile or PERMISSION_KEY not in compute_effective_permissions(user.profile, db):
++        raise HTTPException(status_code=403, detail="Нет доступа к разделу «Telegram»")
++    response.set_cookie(
++        TG_COOKIE,
++        _issue_token(user.id),
++        max_age=TG_SESSION_HOURS * 3600,
++        httponly=True,
++        secure=_cookie_secure(),
++        samesite="strict",
++        path="/",
++    )
++    response.status_code = 204
++    return response
++
++
++@router.delete("/tg/session", status_code=204)
++def close_session(response: Response):
++    """Выход: удалить куку и стереть хранилище сайта (сессию Telegram в IndexedDB,
++    service worker клиента). Без авторизации — должен срабатывать и с протухшим JWT.
++
++    Clear-Site-Data чистит и localStorage — токен Meridian тоже уходит, это и есть
++    выход; фронт всё равно удаляет его сам."""
++    response.delete_cookie(TG_COOKIE, path="/", secure=_cookie_secure(), httponly=True, samesite="strict")
++    response.headers["Clear-Site-Data"] = '"storage"'
++    response.status_code = 204
++    return response
++
++
++@router.get("/tg/auth", include_in_schema=False)
++def check_session(request: Request):
++    """Для nginx auth_request перед раздачей /tg/: 204 — пускать, 401 — нет."""
++    if user_id_from_cookie(request.cookies.get(TG_COOKIE)) is None:
++        return Response(status_code=401)
++    return Response(status_code=204)
++
++
++# ── прокси MTProto ───────────────────────────────────────────────────────────
++
++def _same_origin(headers) -> bool:
++    """Защита от cross-site WebSocket: Origin должен совпадать с Host (nginx и Nginx
++    Proxy Manager должны пробрасывать исходный Host) либо быть в ALLOWED_ORIGINS."""
++    origin, host = headers.get("origin"), headers.get("host")
++    if not origin:
++        return False
++    if host and urlsplit(origin).netloc == host:
++        return True
++    allowed = {o.strip().rstrip("/") for o in settings.allowed_origins.split(",") if o.strip()}
++    return origin.rstrip("/") in allowed
++
++
++@router.post("/tgws/{name}/{path}", include_in_schema=False)
++async def tg_http(name: str, path: str, request: Request):
++    """HTTPS-транспорт MTProto: POST бинарного тела, ответ — бинарный (клиент начинает
++    с него и переходит на WebSocket, как только тот ответит)."""
++    if name not in HTTP_NAMES or path not in HTTP_PATHS:
++        return Response(status_code=404)
++    if user_id_from_cookie(request.cookies.get(TG_COOKIE)) is None:
++        return Response(status_code=401)
++    body = bytearray()
++    async for chunk in request.stream():
++        body += chunk
++        if len(body) > MAX_HTTP_BODY:
++            return Response(status_code=413)
++    try:
++        # bytes(), не bytearray: bytearray httpx принимает за синхронный итератор
++        r = await _http.post(
++            f"https://{name}.web.telegram.org/{path}",
++            content=bytes(body),
++            headers={"Content-Type": "application/octet-stream"},
++        )
++    except httpx.HTTPError as e:
++        logger.warning(f"tg http {name}/{path}: {type(e).__name__} {e}")
++        return Response(status_code=502)
++    return Response(
++        r.content,
++        status_code=r.status_code,
++        media_type=r.headers.get("content-type", "application/octet-stream"),
++    )
++
++
++@router.websocket("/tgws/{name}/{path}")
++async def tg_ws(ws: WebSocket, name: str, path: str):
++    """WebSocket-транспорт MTProto: двунаправленная перекачка бинарных фреймов.
++    Отказ (close до accept) Starlette отдаёт как HTTP 403 на рукопожатие."""
++    if name not in WS_NAMES or path not in WS_PATHS:
++        return await ws.close(code=1008)
++    if not _same_origin(ws.headers) or user_id_from_cookie(ws.cookies.get(TG_COOKIE)) is None:
++        return await ws.close(code=1008)
++
++    offered = [p.strip() for p in ws.headers.get("sec-websocket-protocol", "").split(",") if p.strip()]
++    subprotocol = "binary" if "binary" in offered else None
++    url = f"wss://{name}.web.telegram.org/{path}"
++    try:
++        upstream = await websockets.connect(
++            url,
++            subprotocols=["binary"] if subprotocol else None,
++            max_size=None,
++            open_timeout=15,
++            ping_interval=None,
++            compression=None,
++        )
++    except Exception as e:  # сеть/TLS/отказ Telegram — клиент сам переподключится
++        logger.warning(f"tg ws connect {url}: {type(e).__name__} {e}")
++        return await ws.close(code=1011)
++
++    await ws.accept(subprotocol=subprotocol)
++
++    async def client_to_tg():
++        while True:
++            msg = await ws.receive()
++            if msg["type"] == "websocket.disconnect":
++                return
++            data = msg.get("bytes")
++            if data is None and msg.get("text") is not None:
++                data = msg["text"]
++            if data is not None:
++                await upstream.send(data)
++
++    async def tg_to_client():
++        async for data in upstream:
++            if isinstance(data, bytes):
++                await ws.send_bytes(data)
++            else:
++                await ws.send_text(data)
++
++    tasks = [asyncio.create_task(client_to_tg()), asyncio.create_task(tg_to_client())]
++    try:
++        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
++    finally:
++        for t in tasks:
++            t.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        await upstream.close()
++        try:
++            await ws.close()
++        except Exception:
++            pass
++
++
++async def shutdown() -> None:
++    """Закрыть пул соединений к Telegram (lifespan в main.py)."""
++    await _http.aclose()
+diff --git a/backend/migrations/versions/7a1b2c3d4e5f_add_telegram_permission.py b/backend/migrations/versions/7a1b2c3d4e5f_add_telegram_permission.py
+new file mode 100644
+index 0000000..4944239
+--- /dev/null
++++ b/backend/migrations/versions/7a1b2c3d4e5f_add_telegram_permission.py
+@@ -0,0 +1,36 @@
++"""add telegram permission (раздел «Telegram» — Telegram Web K во вкладке Meridian)
++
++Новый корневой ключ `telegram` (routers/telegram.py, frontend/src/routes/_auth/telegram.tsx).
++is_public=false: admin/owner получают его автоматически (весь каталог), остальным —
++выдаётся в админке (пользователю или через дефолты роли/линии). Сделать раздел видимым
++всем — `UPDATE feature_permissions SET is_public = true WHERE key = 'telegram'`.
++
++Revision ID: 7a1b2c3d4e5f
++Revises: 0e1f2a3b4c5d
++Create Date: 2026-10-01 00:00:00.000000
++
++"""
++from typing import Sequence, Union
++
++from alembic import op
++
++
++# revision identifiers, used by Alembic.
++revision: str = '7a1b2c3d4e5f'
++down_revision: Union[str, Sequence[str], None] = '0e1f2a3b4c5d'
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++def upgrade() -> None:
++    op.execute("""
++        INSERT INTO feature_permissions (key, parent_key, name, is_public, "order") VALUES
++            ('telegram', NULL, 'Telegram', false, 18)
++        ON CONFLICT (key) DO NOTHING
++    """)
++
++
++def downgrade() -> None:
++    op.execute("DELETE FROM role_default_permissions WHERE permission_key = 'telegram'")
++    op.execute("DELETE FROM line_default_permissions WHERE permission_key = 'telegram'")
++    op.execute("DELETE FROM feature_permissions WHERE key = 'telegram'")
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index f518237..b75fd6c 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -20,3 +20,6 @@ httpx>=0.27.0
+ tenacity>=8.2.0
+ holidays>=0.60,<1.0
+ tzdata>=2024.1
++# Прокси Telegram во вкладке (routers/telegram.py): клиент WebSocket до *.web.telegram.org.
++# uvicorn[standard] тоже его тянет, но версию >=15 (подхват HTTPS_PROXY) фиксируем явно.
++websockets>=15
+diff --git a/backend/tests/test_telegram_router.py b/backend/tests/test_telegram_router.py
+new file mode 100644
+index 0000000..6906781
+--- /dev/null
++++ b/backend/tests/test_telegram_router.py
+@@ -0,0 +1,197 @@
++"""routers/telegram.py — раздел «Telegram» (Telegram Web K во вкладке Meridian).
++
++Приложение собирается с root_path="/api", как main.py: nginx обрезает /api у
++/api/tg/session, а /tgws/... проксирует без обрезки — оба вида путей должны
++маршрутизироваться. До Telegram тесты не ходят: апстрим подменяется (respx) либо
++запрос отклоняется раньше."""
++import os
++from types import SimpleNamespace
++
++os.environ.setdefault("APP_SECRET_KEY", "test-secret")
++os.environ.setdefault("DATABASE_URL", "sqlite://")
++os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
++os.environ.setdefault("MINIO_URL", "http://localhost:9000")
++os.environ.setdefault("MINIO_ROOT_USER", "test")
++os.environ.setdefault("MINIO_ROOT_PASSWORD", "test")
++
++import httpx
++import pytest
++import respx
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from starlette.websockets import WebSocketDisconnect
++
++from app.database import get_db
++from app.dependencies import get_current_user
++from app.routers import telegram
++from app.services.auth import create_access_token
++
++
++def _user(permissions: set[str]):
++    return SimpleNamespace(id=7, is_active=True, profile=SimpleNamespace(_perms=permissions))
++
++
++@pytest.fixture()
++def make_client(monkeypatch):
++    def _make(permissions: set[str] = frozenset({"telegram"})):
++        app = FastAPI(root_path="/api")
++        app.include_router(telegram.router)
++        app.dependency_overrides[get_current_user] = lambda: _user(set(permissions))
++        app.dependency_overrides[get_db] = lambda: None
++        monkeypatch.setattr(telegram, "compute_effective_permissions", lambda profile, db: profile._perms)
++        return TestClient(app, base_url="https://meridian.test")
++    return _make
++
++
++def _cookie(client: TestClient) -> str:
++    r = client.post("/tg/session")
++    assert r.status_code == 204
++    token = client.cookies.get(telegram.TG_COOKIE)
++    # Пересаживаем без домена: cookiejar httpx не прикладывает куку из Set-Cookie к
++    # ws://-рукопожатию TestClient (браузер прикладывает — тот же хост).
++    client.cookies.clear()
++    client.cookies.set(telegram.TG_COOKIE, token)
++    return token
++
++
++def test_session_sets_scoped_httponly_cookie(make_client):
++    client = make_client()
++    r = client.post("/tg/session")
++    assert r.status_code == 204
++    set_cookie = r.headers["set-cookie"]
++    assert set_cookie.startswith(f"{telegram.TG_COOKIE}=")
++    assert "HttpOnly" in set_cookie and "Path=/" in set_cookie and "SameSite=strict" in set_cookie
++    assert telegram.user_id_from_cookie(client.cookies.get(telegram.TG_COOKIE)) == 7
++
++
++def test_session_requires_permission(make_client):
++    client = make_client(permissions=set())
++    r = client.post("/tg/session")
++    assert r.status_code == 403
++    assert telegram.TG_COOKIE not in client.cookies
++
++
++def test_auth_check_for_nginx(make_client):
++    client = make_client()
++    assert client.get("/tg/auth").status_code == 401
++    _cookie(client)
++    assert client.get("/tg/auth").status_code == 204
++
++
++def test_regular_access_token_is_not_a_tg_cookie(make_client):
++    """Обычный JWT Meridian (без scope) куку Telegram не заменяет."""
++    client = make_client()
++    client.cookies.set(telegram.TG_COOKIE, create_access_token(7))
++    assert client.get("/tg/auth").status_code == 401
++    assert telegram.user_id_from_cookie("garbage") is None
++
++
++def test_logout_clears_cookie_and_site_storage(make_client):
++    client = make_client()
++    _cookie(client)
++    r = client.delete("/tg/session")
++    assert r.status_code == 204
++    assert r.headers["clear-site-data"] == '"storage"'
++    set_cookie = r.headers["set-cookie"]
++    assert set_cookie.startswith(f'{telegram.TG_COOKIE}=""') and "Max-Age=0" in set_cookie
++
++
++def test_http_transport_whitelist_and_auth(make_client):
++    client = make_client()
++    # не из белого списка — 404 даже с кукой: это не открытый прокси
++    _cookie(client)
++    assert client.post("/tgws/evil/apiw1", content=b"x").status_code == 404
++    assert client.post("/tgws/venus/other", content=b"x").status_code == 404
++    client.cookies.clear()
++    assert client.post("/tgws/venus/apiw1", content=b"x").status_code == 401
++
++
++def test_http_transport_body_limit(make_client):
++    client = make_client()
++    _cookie(client)
++    r = client.post("/tgws/venus/apiw1", content=b"x" * (telegram.MAX_HTTP_BODY + 1))
++    assert r.status_code == 413
++
++
++@respx.mock
++def test_http_transport_forwards_bytes(make_client):
++    route = respx.post("https://venus.web.telegram.org/apiw1").mock(
++        return_value=httpx.Response(200, content=b"\x01\x02", headers={"content-type": "application/octet-stream"})
++    )
++    client = make_client()
++    _cookie(client)
++    r = client.post("/tgws/venus/apiw1", content=b"\xff\x00")
++    assert r.status_code == 200
++    assert r.content == b"\x01\x02"
++    assert route.calls.last.request.content == b"\xff\x00"
++
++
++@pytest.mark.parametrize(
++    "path, origin, with_cookie",
++    [
++        ("/tgws/kws2/apiws", "https://meridian.test", False),        # без куки
++        ("/tgws/kws2/apiws", "https://evil.example", True),          # чужой Origin
++        ("/tgws/evil/apiws", "https://meridian.test", True),         # не из белого списка
++        ("/tgws/kws2/other", "https://meridian.test", True),
++    ],
++)
++def test_ws_rejected(make_client, path, origin, with_cookie):
++    client = make_client()
++    if with_cookie:
++        _cookie(client)
++    with pytest.raises(WebSocketDisconnect) as exc:
++        with client.websocket_connect(path, headers={"origin": origin, "host": "meridian.test"}):
++            pass
++    assert exc.value.code == 1008
++
++
++def test_same_origin():
++    assert telegram._same_origin({"origin": "https://m.kz", "host": "m.kz"})
++    assert telegram._same_origin({"origin": "https://m.kz:8443", "host": "m.kz:8443"})
++    assert not telegram._same_origin({"origin": "https://m.kz", "host": "m.kz:8443"})
++    assert not telegram._same_origin({"host": "m.kz"})
++    assert telegram._same_origin({"origin": "http://localhost:5173", "host": "api:8000"})
++
++
++class _FakeUpstream:
++    """Подмена websockets.connect: отвечает эхом с префиксом."""
++
++    def __init__(self):
++        import asyncio
++        self.queue = asyncio.Queue()
++        self.closed = False
++
++    async def send(self, data):
++        await self.queue.put(b"tg:" + data)
++
++    def __aiter__(self):
++        return self
++
++    async def __anext__(self):
++        return await self.queue.get()
++
++    async def close(self):
++        self.closed = True
++
++
++def test_ws_relays_binary_frames(make_client, monkeypatch):
++    seen = {}
++
++    async def fake_connect(url, **kwargs):
++        seen["url"], seen["subprotocols"] = url, kwargs.get("subprotocols")
++        seen["upstream"] = _FakeUpstream()
++        return seen["upstream"]
++
++    monkeypatch.setattr(telegram.websockets, "connect", fake_connect)
++    client = make_client()
++    _cookie(client)
++    with client.websocket_connect(
++        "/tgws/kws2/apiws",
++        headers={"origin": "https://meridian.test", "host": "meridian.test"},
++        subprotocols=["binary"],
++    ) as ws:
++        assert ws.accepted_subprotocol == "binary"
++        ws.send_bytes(b"\x00\x01")
++        assert ws.receive_bytes() == b"tg:\x00\x01"
++    assert seen["url"] == "wss://kws2.web.telegram.org/apiws"
++    assert seen["subprotocols"] == ["binary"]
+diff --git a/docs/telegram.md b/docs/telegram.md
+new file mode 100644
+index 0000000..48d57e7
+--- /dev/null
++++ b/docs/telegram.md
+@@ -0,0 +1,92 @@
++# Раздел «Telegram»
++
++Пункт меню **Telegram** (`/telegram`) — полноценный Telegram Web K
++(https://github.com/morethanwords/tweb, GPL-3.0, коммит
++`e55552763f3dcca269230bb7487213bbaf82ff6a`, версия 2.2 (676)) внутри Meridian, в iframe.
++Браузер ходит только на хост Meridian, сервер — к Telegram:
++
++| Клиент | Куда проксирует API |
++|---|---|
++| `wss://<хост>/tgws/kws{1-5}[-1]/apiws[_premium]` | `wss://kws…web.telegram.org/…` |
++| `POST https://<хост>/tgws/{pluto,venus,aurora,vesta,flora}[-1]/apiw1` | `https://…web.telegram.org/apiw1` |
++
++Имена и пути — белый список в `backend/app/routers/telegram.py`, остальное: WS 403,
++POST 404. MTProto шифруется в браузере, сервер гоняет байты как есть. Сессия Telegram у
++каждого своя, в IndexedDB его браузера; на сервере не хранится.
++
++## Как устроено
++
++| Часть | Файл |
++|---|---|
++| Клиент (готовая сборка, адреса DC уже переписаны на `/tgws/`) | `frontend/public/tg/` → в образе nginx `/usr/share/nginx/html/tg/` |
++| Прокси MTProto, выдача/проверка куки | `backend/app/routers/telegram.py` |
++| nginx: `/tg/` (статика за `auth_request`), `/tgws/` (WS + POST в API) | `frontend/nginx.conf` |
++| Страница раздела (шапка, iframe, ошибки) | `frontend/src/components/telegram/telegram-panel.tsx` |
++| Роут (только проверка права) | `frontend/src/routes/_auth/telegram.tsx` |
++| Право `telegram` | `backend/migrations/versions/7a1b2c3d4e5f_add_telegram_permission.py` |
++| Обновление клиента | `scripts/tg_patch.py` |
++
++**Авторизация.** Основной API — JWT в `Authorization`, но iframe, статика и WebSocket
++заголовок приложить не могут. Страница `/telegram` делает `POST /api/tg/session` (Bearer +
++право `telegram`) и получает httpOnly-куку `meridian_tg` (отдельный JWT со `scope=tg`,
++12 ч, страница продлевает её каждые 30 мин). Её проверяют nginx (`auth_request` →
++`GET /api/tg/auth`) перед каждым файлом `/tg/` и сам прокси `/tgws/`. У WebSocket
++дополнительно Origin должен совпадать с Host. Исключение — скрипт service worker'а
++`/tg/sw-*.js`: Chromium запрашивает его без куки.
++
++**Панель живёт в layout.** `TelegramPanel` смонтирован в `routes/_auth.tsx` и при уходе в
++другой раздел только прячется — клиент не перезагружается и не теряет соединение.
++
++**Выход.** «Выйти» в сайдбаре (и авто-выход по 401) зовёт `DELETE /api/tg/session`: кука
++удаляется, ответ несёт `Clear-Site-Data: "storage"` — браузер стирает IndexedDB,
++localStorage, service worker сайта. Следующий человек на том же профиле браузера чужой
++Telegram не увидит. Побочный эффект: сбрасывается и выбранная тема Meridian.
++
++**Права.** Ключ `telegram`, `is_public=false`: admin/owner видят раздел сразу,
++остальным — выдать в «Администратор → Пользователи/Роли». Открыть всем:
++`UPDATE feature_permissions SET is_public = true WHERE key = 'telegram';`
++
++## Требования к серверу
++
++- Исходящий доступ из контейнера `api` к `*.web.telegram.org:443`. Если выход через
++  прокси — `HTTPS_PROXY` в `.env` (подхватывают и `httpx`, и `websockets>=15`).
++- HTTPS: клиент всегда строит `wss://` и `https://`, service worker не регистрируется
++  на недоверенном сертификате.
++- Nginx Proxy Manager: в proxy host Meridian включить **Websockets Support** (иначе
++  `/tgws/` не апгрейдится). NPM пробрасывает исходный Host — это нужно для проверки
++  Origin == Host.
++- Meridian должен быть в корне домена: адрес `/tgws/` в клиенте абсолютный.
++
++## Как проверить
++
++1. Без входа: `https://<хост>/tg/` → 302 на `/telegram` (→ `/login`); `curl` без куки — 401.
++2. Пользователь с правом `telegram` видит пункт меню, в нём экран входа Telegram (QR /
++   номер телефона).
++3. DevTools → Network → WS: соединение `wss://<хост>/tgws/kws2/apiws`, запросов на
++   `*.telegram.org` нет.
++4. QR появляется, вход по номеру присылает код. Если QR крутится бесконечно —
++   `docker compose logs api | grep "tg "`: строки `tg ws connect …` / `tg http …` значат,
++   что сервер не достучался до Telegram (сеть/прокси).
++
++## Как обновить клиент
++
++`frontend/public/tg/` — официальная готовая сборка из `public/` репозитория tweb.
++
++```
++git clone --recurse-submodules https://github.com/morethanwords/tweb
++python scripts/tg_patch.py build <tweb>/public          # готовая сборка
++# или из исходников (Node ^22.18 / ≥24.11, pnpm):
++cd tweb && pnpm install && pnpm exec vite build && python <meridian>/scripts/tg_patch.py build dist
++```
++
++`tg_patch.py build` копирует сборку в `frontend/public/tg/` (без `.map`) и заменяет адреса
++DC в JS. Если шаблон адреса не найден — падает с ошибкой: значит, tweb поменял
++`src/lib/mtproto/dcConfigurator.ts`, надо поправить регулярки. Затем пересобрать образ
++`frontend`. У пользователей старый клиент держит service worker — обновится при следующей
++загрузке вкладки.
++
++## Что не работает через прокси
++
++Оплаты (api.stripe.com и др.), web-push уведомления, внешние ссылки (t.me, telegram.org)
++— открываются в браузере напрямую. Мини-приложения ботов грузятся с внешних доменов —
++CSP `/tg/` их не пустит.
+diff --git a/frontend/nginx.conf b/frontend/nginx.conf
+index 2b6868f..e6d4653 100644
+--- a/frontend/nginx.conf
++++ b/frontend/nginx.conf
+@@ -1,3 +1,9 @@
++# WebSocket для /tgws/ (Telegram): Upgrade пробрасываем, только если клиент его прислал.
++map $http_upgrade $connection_upgrade {
++    default upgrade;
++    ''      close;
++}
++
+ server {
+     listen 80;
+     root /usr/share/nginx/html;
+@@ -40,6 +46,65 @@ server {
+         proxy_read_timeout 3600s;
+     }
+ 
++    # ── Telegram во вкладке (раздел «Telegram», backend/app/routers/telegram.py) ──
++    # Клиент Telegram Web K — статикой из public/tg/. Пускаем только с кукой
++    # meridian_tg (её выдаёт POST /api/tg/session со страницы /telegram), проверка —
++    # подзапросом в API. Исключение — скрипт service worker'а: Chromium запрашивает
++    # его без куки, а с 401 SW не регистрируется (файл без данных, доступ к самому
++    # Telegram через /tgws/ всё равно только по куке).
++    location = /_tg_auth {
++        internal;
++        set $api_upstream http://api:8000;
++        proxy_pass $api_upstream/tg/auth;
++        proxy_pass_request_body off;
++        proxy_set_header Content-Length "";
++        proxy_set_header Host $host;
++    }
++
++    location @tg_unauthorized {
++        # Открыли /tg/ отдельной вкладкой без куки — на страницу раздела, она выдаст куку.
++        if ($http_sec_fetch_dest = document) {
++            return 302 /telegram;
++        }
++        return 401;
++    }
++
++    location ^~ /tg/ {
++        auth_request /_tg_auth;
++        error_page 401 = @tg_unauthorized;
++        # Своя CSP: клиенту нужны blob:/wasm/воркеры, opus-воркеры голосовых собраны
++        # emscripten'ом (new Function -> 'unsafe-eval'). frame-ancestors 'self' — для iframe.
++        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' blob: data:; frame-src 'self' blob:; frame-ancestors 'self'; base-uri 'self'; form-action 'self'" always;
++        add_header X-Content-Type-Options nosniff always;
++        add_header Cache-Control "no-cache" always;
++        try_files $uri $uri/ =404;
++
++        location ~ ^/tg/sw-[A-Za-z0-9_-]+\.js$ {
++            auth_request off;
++            add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; connect-src 'self' blob: data:" always;
++            add_header Cache-Control "no-cache" always;
++            try_files $uri =404;
++        }
++    }
++
++    # MTProto-прокси до *.web.telegram.org (WebSocket + HTTPS-транспорт). Префикс НЕ
++    # обрезаем — роутер в API висит на /tgws/. Host пробрасываем исходный ($http_host,
++    # с портом) — API сверяет с ним Origin у WebSocket.
++    location ^~ /tgws/ {
++        set $api_upstream http://api:8000;
++        proxy_pass $api_upstream;
++        proxy_http_version 1.1;
++        proxy_set_header Host $http_host;
++        proxy_set_header Upgrade $http_upgrade;
++        proxy_set_header Connection $connection_upgrade;
++        proxy_set_header X-Real-IP $remote_addr;
++        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++        proxy_buffering off;
++        proxy_read_timeout 120s;
++        proxy_send_timeout 120s;
++        client_max_body_size 3m;
++    }
++
+     # Статика с кешированием
+     location ~* \.(js|css|png|jpg|jpeg|svg|ico|woff2?)$ {
+         expires 1y;
+diff --git a/frontend/src/components/app-sidebar.tsx b/frontend/src/components/app-sidebar.tsx
+index 40deb70..848a216 100644
+--- a/frontend/src/components/app-sidebar.tsx
++++ b/frontend/src/components/app-sidebar.tsx
+@@ -1,10 +1,11 @@
+ import { useState, useEffect, useRef, useCallback } from "react";
+ import { Link, useRouterState, useRouter } from "@tanstack/react-router";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+-import { LayoutDashboard, BarChart3, Archive, Wrench, LogOut, User, ShieldCheck, Menu, Bell, ClipboardList, Sparkles, Hash, Radar, KanbanSquare } from "lucide-react";
++import { LayoutDashboard, BarChart3, Archive, Wrench, LogOut, User, ShieldCheck, Menu, Bell, ClipboardList, Sparkles, Hash, Radar, KanbanSquare, Send } from "lucide-react";
+ import { cn } from "@/lib/utils";
+ import { getMeApi, getInitials, removeToken, getToken } from "@/lib/auth";
+ import { hasSection } from "@/lib/permissions";
++import { closeTelegramSession, TELEGRAM_PERMISSION } from "@/lib/telegram";
+ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+ import { fetchUnreadCount, fetchNotifications, markAllNotificationsRead, markNotificationRead, type Notification } from "@/lib/tickets";
+ import { ThemeToggle } from "@/components/theme-toggle";
+@@ -451,6 +452,9 @@ export function AppSidebar() {
+   // "tracker" is_public в feature_permissions), доступ к конкретной доске — живые
+   // гранты внутри самого модуля (см. src/tracker/), не на уровне этого пункта меню.
+   const hasTracker = hasSection(permissions, "tracker");
++  // «Telegram» — Telegram Web K во вкладке (backend/app/routers/telegram.py), право
++  // "telegram" (не публичное: admin/owner — автоматически, остальным выдаётся в админке).
++  const hasTelegram = permissions.includes(TELEGRAM_PERMISSION);
+ 
+   const items: NavItem[] = [
+     ...BASE_ITEMS,
+@@ -479,6 +483,7 @@ export function AppSidebar() {
+     // «Задачи» — трекер (docs/proposals/tracker.md), право "tracker" is_public — виден
+     // всем авторизованным; доступ к конкретной доске выдаётся отдельно живыми грантами.
+     ...(hasTracker ? [{ label: "Задачи", to: "/tracker" as const, icon: KanbanSquare }] : []),
++    ...(hasTelegram ? [{ label: "Telegram", to: "/telegram" as const, icon: Send }] : []),
+     ...(hasTools ? [{ label: "Инструменты", to: "/tools" as const, icon: Wrench }] : []),
+     ...(canSeeAdminSection ? [{ label: "Администратор", to: "/admin" as const, icon: ShieldCheck }] : []),
+     // АРМ Сотрудника — хаб (демо-витрина ИИ-разбора без бэкенда + "Регистрационные
+@@ -495,7 +500,9 @@ export function AppSidebar() {
+     retry: false,
+   });
+ 
+-  function handleLogout() {
++  async function handleLogout() {
++    // До removeToken: стирает куку Telegram и хранилище сайта (сессию TG в IndexedDB).
++    await closeTelegramSession();
+     removeToken();
+     qc.clear();
+     void router.navigate({ to: "/login" });
+diff --git a/frontend/src/components/telegram/telegram-panel.tsx b/frontend/src/components/telegram/telegram-panel.tsx
+new file mode 100644
+index 0000000..22c32eb
+--- /dev/null
++++ b/frontend/src/components/telegram/telegram-panel.tsx
+@@ -0,0 +1,159 @@
++import { useCallback, useEffect, useState } from "react";
++import { useRouterState } from "@tanstack/react-router";
++import { AlertTriangle, ExternalLink, Loader2, RotateCw, Send, ShieldCheck } from "lucide-react";
++import { Button } from "@/components/ui/button";
++import { useMe } from "@/lib/auth";
++import { cn } from "@/lib/utils";
++import {
++  TELEGRAM_CLIENT_URL,
++  TELEGRAM_PERMISSION,
++  TELEGRAM_SESSION_REFRESH_MS,
++  openTelegramSession,
++} from "@/lib/telegram";
++
++export const TELEGRAM_ROUTE = "/telegram";
++
++type SessionState = { status: "loading" } | { status: "ready" } | { status: "error"; message: string };
++
++/**
++ * Раздел «Telegram». Живёт в _auth-layout, а не в самом роуте: роут /telegram
++ * рендерит null, а эта панель монтируется при первом заходе и дальше только
++ * прячется. Иначе каждый уход в другой раздел выгружал бы iframe — клиент
++ * Telegram перезагружался бы заново и рвал соединение (уведомления, звонки).
++ */
++export function TelegramPanel() {
++  const pathname = useRouterState({ select: (s) => s.location.pathname });
++  const { data: me } = useMe();
++  // Сам роут без права уводит на /403 (beforeLoad); здесь — чтобы панель не успела
++  // смонтироваться и дёрнуть /api/tg/session в момент этого редиректа.
++  const allowed = me?.permissions.includes(TELEGRAM_PERMISSION) ?? false;
++  const active = allowed && pathname === TELEGRAM_ROUTE;
++  const [mounted, setMounted] = useState(active);
++
++  useEffect(() => {
++    if (active) setMounted(true);
++  }, [active]);
++
++  if (!mounted) return null;
++  return <TelegramWorkspace active={active} />;
++}
++
++function TelegramWorkspace({ active }: { active: boolean }) {
++  const [session, setSession] = useState<SessionState>({ status: "loading" });
++  const [frameKey, setFrameKey] = useState(0);
++  const [frameLoaded, setFrameLoaded] = useState(false);
++
++  const connect = useCallback(async () => {
++    setSession({ status: "loading" });
++    try {
++      await openTelegramSession();
++      setSession({ status: "ready" });
++    } catch (e) {
++      setSession({ status: "error", message: e instanceof Error ? e.message : "Ошибка" });
++    }
++  }, []);
++
++  useEffect(() => {
++    void connect();
++  }, [connect]);
++
++  // Продлеваем куку, пока панель жива (в том числе скрытая — клиент работает в фоне).
++  useEffect(() => {
++    if (session.status !== "ready") return;
++    const id = window.setInterval(() => {
++      openTelegramSession().catch(() => {
++        /* следующая попытка через интервал; при 401 interceptor сам уведёт на /login */
++      });
++    }, TELEGRAM_SESSION_REFRESH_MS);
++    return () => window.clearInterval(id);
++  }, [session.status]);
++
++  function reloadFrame() {
++    setFrameLoaded(false);
++    setFrameKey((k) => k + 1);
++  }
++
++  return (
++    <section
++      aria-label="Telegram"
++      className={cn(
++        "flex h-[calc(100dvh-3.5rem)] flex-col gap-4 p-4 md:h-dvh md:p-6",
++        !active && "hidden",
++      )}
++    >
++      <header className="flex flex-wrap items-center gap-4">
++        <div className="grid size-11 shrink-0 place-items-center rounded-xl bg-sky-500/10 text-sky-500">
++          <Send className="size-5" strokeWidth={1.75} />
++        </div>
++        <div className="min-w-0 flex-1">
++          <h1 className="text-2xl font-bold tracking-tight text-foreground">Telegram</h1>
++          <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
++            <ShieldCheck className="size-3.5 shrink-0" strokeWidth={1.75} />
++            <span className="truncate">
++              Каждый входит в свой аккаунт; сессия хранится только в этом браузере и стирается при выходе из Meridian
++            </span>
++          </p>
++        </div>
++        <div className="flex items-center gap-2">
++          <Button
++            variant="outline"
++            size="sm"
++            onClick={reloadFrame}
++            disabled={session.status !== "ready"}
++            title="Перезагрузить клиент Telegram"
++          >
++            <RotateCw strokeWidth={1.75} />
++            Обновить
++          </Button>
++          <Button variant="outline" size="sm" asChild>
++            <a href={TELEGRAM_CLIENT_URL} target="_blank" rel="noopener">
++              <ExternalLink strokeWidth={1.75} />
++              В новой вкладке
++            </a>
++          </Button>
++        </div>
++      </header>
++
++      <div className="relative min-h-[360px] flex-1 overflow-hidden rounded-xl border border-border bg-card shadow-xs">
++        {session.status === "ready" && (
++          <iframe
++            key={frameKey}
++            src={TELEGRAM_CLIENT_URL}
++            title="Telegram"
++            allow="clipboard-read; clipboard-write; microphone; camera; autoplay; fullscreen"
++            onLoad={() => setFrameLoaded(true)}
++            className={cn(
++              "absolute inset-0 size-full border-0 transition-opacity duration-300",
++              frameLoaded ? "opacity-100" : "opacity-0",
++            )}
++          />
++        )}
++
++        {(session.status === "loading" || (session.status === "ready" && !frameLoaded)) && (
++          <div className="absolute inset-0 grid place-items-center">
++            <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
++              <Loader2 className="size-6 animate-spin text-sky-500" strokeWidth={1.75} />
++              Подключение к Telegram…
++            </div>
++          </div>
++        )}
++
++        {session.status === "error" && (
++          <div className="absolute inset-0 grid place-items-center p-6">
++            <div className="flex max-w-sm flex-col items-center gap-3 text-center">
++              <div className="grid size-11 place-items-center rounded-xl bg-destructive/10 text-destructive">
++                <AlertTriangle className="size-5" strokeWidth={1.75} />
++              </div>
++              <p className="text-sm font-semibold text-foreground">Telegram недоступен</p>
++              <p className="text-sm text-muted-foreground">{session.message}</p>
++              <Button size="sm" onClick={() => void connect()}>
++                <RotateCw strokeWidth={1.75} />
++                Повторить
++              </Button>
++            </div>
++          </div>
++        )}
++      </div>
++    </section>
++  );
++}
+diff --git a/frontend/src/lib/auth.ts b/frontend/src/lib/auth.ts
+index 606b2f1..bb68258 100644
+--- a/frontend/src/lib/auth.ts
++++ b/frontend/src/lib/auth.ts
+@@ -80,6 +80,9 @@ export function installAuthInterceptor(
+       const input = args[0];
+       const url = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
+       if (url.startsWith("/api/") && !url.startsWith("/api/auth/login") && getToken()) {
++        // Сессия Meridian протухла — гасим и Telegram во вкладке (кука + Clear-Site-Data,
++        // см. lib/telegram.ts::closeTelegramSession; не импортируем — цикл auth <-> telegram).
++        void originalFetch("/api/tg/session", { method: "DELETE" }).catch(() => undefined);
+         removeToken();
+         queryClient.clear();
+         void router.navigate({ to: "/login" });
+diff --git a/frontend/src/lib/telegram.ts b/frontend/src/lib/telegram.ts
+new file mode 100644
+index 0000000..b847bf8
+--- /dev/null
++++ b/frontend/src/lib/telegram.ts
+@@ -0,0 +1,30 @@
++import { authHeaders } from "@/lib/auth";
++
++// Раздел «Telegram» (backend/app/routers/telegram.py). Клиент Telegram Web K
++// раздаётся nginx'ом как /tg/ (public/tg/) и ходит к Telegram через /tgws/ на этом же
++// хосте. iframe и WebSocket не умеют слать Authorization, поэтому API по обычному
++// Bearer выдаёт отдельную httpOnly-куку — её и проверяют /tg/ и /tgws/.
++
++export const TELEGRAM_PERMISSION = "telegram";
++export const TELEGRAM_CLIENT_URL = "/tg/";
++// Кука живёт 12 ч — продлеваем, пока страница открыта (с запасом на сон ноутбука).
++export const TELEGRAM_SESSION_REFRESH_MS = 30 * 60 * 1000;
++
++export async function openTelegramSession(): Promise<void> {
++  const res = await fetch("/api/tg/session", { method: "POST", headers: authHeaders() });
++  if (!res.ok) {
++    if (res.status === 403) throw new Error("Нет доступа к разделу «Telegram» — обратитесь к администратору");
++    throw new Error("Не удалось открыть сессию Telegram");
++  }
++}
++
++/** Выход из Meridian: сервер удаляет куку и шлёт Clear-Site-Data — браузер стирает
++ *  сессию Telegram (IndexedDB) и service worker клиента, следующий человек на этом
++ *  же ПК чужой Telegram не увидит. Ошибки глотаем — выход не должен застревать. */
++export async function closeTelegramSession(): Promise<void> {
++  try {
++    await fetch("/api/tg/session", { method: "DELETE" });
++  } catch {
++    /* сеть — выходим всё равно */
++  }
++}
+diff --git a/frontend/src/routeTree.gen.ts b/frontend/src/routeTree.gen.ts
+index 570aab1..177a3df 100644
+--- a/frontend/src/routeTree.gen.ts
++++ b/frontend/src/routeTree.gen.ts
+@@ -17,6 +17,7 @@ import { Route as AuthTrackerRouteImport } from './routes/_auth/tracker'
+ import { Route as AuthToolsRouteImport } from './routes/_auth/tools'
+ import { Route as AuthTicketsRouteImport } from './routes/_auth/tickets'
+ import { Route as AuthTicketParsingRouteImport } from './routes/_auth/ticket-parsing'
++import { Route as AuthTelegramRouteImport } from './routes/_auth/telegram'
+ import { Route as AuthSituationCenterRouteImport } from './routes/_auth/situation-center'
+ import { Route as AuthReportsRouteImport } from './routes/_auth/reports'
+ import { Route as AuthRegistrationRouteImport } from './routes/_auth/registration'
+@@ -68,6 +69,11 @@ const AuthTicketParsingRoute = AuthTicketParsingRouteImport.update({
+   path: '/ticket-parsing',
+   getParentRoute: () => AuthRoute,
+ } as any)
++const AuthTelegramRoute = AuthTelegramRouteImport.update({
++  id: '/telegram',
++  path: '/telegram',
++  getParentRoute: () => AuthRoute,
++} as any)
+ const AuthSituationCenterRoute = AuthSituationCenterRouteImport.update({
+   id: '/situation-center',
+   path: '/situation-center',
+@@ -138,6 +144,7 @@ export interface FileRoutesByFullPath {
+   '/registration': typeof AuthRegistrationRoute
+   '/reports': typeof AuthReportsRoute
+   '/situation-center': typeof AuthSituationCenterRoute
++  '/telegram': typeof AuthTelegramRoute
+   '/ticket-parsing': typeof AuthTicketParsingRoute
+   '/tickets': typeof AuthTicketsRoute
+   '/tools': typeof AuthToolsRoute
+@@ -157,6 +164,7 @@ export interface FileRoutesByTo {
+   '/registration': typeof AuthRegistrationRoute
+   '/reports': typeof AuthReportsRoute
+   '/situation-center': typeof AuthSituationCenterRoute
++  '/telegram': typeof AuthTelegramRoute
+   '/ticket-parsing': typeof AuthTicketParsingRoute
+   '/tickets': typeof AuthTicketsRoute
+   '/tools': typeof AuthToolsRoute
+@@ -179,6 +187,7 @@ export interface FileRoutesById {
+   '/_auth/registration': typeof AuthRegistrationRoute
+   '/_auth/reports': typeof AuthReportsRoute
+   '/_auth/situation-center': typeof AuthSituationCenterRoute
++  '/_auth/telegram': typeof AuthTelegramRoute
+   '/_auth/ticket-parsing': typeof AuthTicketParsingRoute
+   '/_auth/tickets': typeof AuthTicketsRoute
+   '/_auth/tools': typeof AuthToolsRoute
+@@ -202,6 +211,7 @@ export interface FileRouteTypes {
+     | '/registration'
+     | '/reports'
+     | '/situation-center'
++    | '/telegram'
+     | '/ticket-parsing'
+     | '/tickets'
+     | '/tools'
+@@ -221,6 +231,7 @@ export interface FileRouteTypes {
+     | '/registration'
+     | '/reports'
+     | '/situation-center'
++    | '/telegram'
+     | '/ticket-parsing'
+     | '/tickets'
+     | '/tools'
+@@ -242,6 +253,7 @@ export interface FileRouteTypes {
+     | '/_auth/registration'
+     | '/_auth/reports'
+     | '/_auth/situation-center'
++    | '/_auth/telegram'
+     | '/_auth/ticket-parsing'
+     | '/_auth/tickets'
+     | '/_auth/tools'
+@@ -314,6 +326,13 @@ declare module '@tanstack/react-router' {
+       preLoaderRoute: typeof AuthTicketParsingRouteImport
+       parentRoute: typeof AuthRoute
+     }
++    '/_auth/telegram': {
++      id: '/_auth/telegram'
++      path: '/telegram'
++      fullPath: '/telegram'
++      preLoaderRoute: typeof AuthTelegramRouteImport
++      parentRoute: typeof AuthRoute
++    }
+     '/_auth/situation-center': {
+       id: '/_auth/situation-center'
+       path: '/situation-center'
+@@ -417,6 +436,7 @@ interface AuthRouteChildren {
+   AuthRegistrationRoute: typeof AuthRegistrationRoute
+   AuthReportsRoute: typeof AuthReportsRoute
+   AuthSituationCenterRoute: typeof AuthSituationCenterRoute
++  AuthTelegramRoute: typeof AuthTelegramRoute
+   AuthTicketParsingRoute: typeof AuthTicketParsingRoute
+   AuthTicketsRoute: typeof AuthTicketsRoute
+   AuthToolsRoute: typeof AuthToolsRoute
+@@ -435,6 +455,7 @@ const AuthRouteChildren: AuthRouteChildren = {
+   AuthRegistrationRoute: AuthRegistrationRoute,
+   AuthReportsRoute: AuthReportsRoute,
+   AuthSituationCenterRoute: AuthSituationCenterRoute,
++  AuthTelegramRoute: AuthTelegramRoute,
+   AuthTicketParsingRoute: AuthTicketParsingRoute,
+   AuthTicketsRoute: AuthTicketsRoute,
+   AuthToolsRoute: AuthToolsRoute,
+diff --git a/frontend/src/routes/_auth.tsx b/frontend/src/routes/_auth.tsx
+index 0e575fc..e958e5b 100644
+--- a/frontend/src/routes/_auth.tsx
++++ b/frontend/src/routes/_auth.tsx
+@@ -2,6 +2,7 @@ import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
+ import { useQueryClient } from "@tanstack/react-query";
+ import { AppSidebar } from "@/components/app-sidebar";
+ import { ChangePasswordModal } from "@/components/change-password-modal";
++import { TelegramPanel } from "@/components/telegram/telegram-panel";
+ import { getToken, useMe } from "@/lib/auth";
+ 
+ export const Route = createFileRoute("/_auth")({
+@@ -28,6 +29,7 @@ function AuthLayout() {
+         <AppSidebar />
+         <main className="pt-14 md:pt-0 md:pl-64">
+           <Outlet />
++          <TelegramPanel />
+         </main>
+       </div>
+ 
+diff --git a/frontend/src/routes/_auth/telegram.tsx b/frontend/src/routes/_auth/telegram.tsx
+new file mode 100644
+index 0000000..548f604
+--- /dev/null
++++ b/frontend/src/routes/_auth/telegram.tsx
+@@ -0,0 +1,15 @@
++import { createFileRoute, redirect } from "@tanstack/react-router";
++import { getMeApi } from "@/lib/auth";
++import { TELEGRAM_PERMISSION } from "@/lib/telegram";
++
++export const Route = createFileRoute("/_auth/telegram")({
++  beforeLoad: async ({ context: { queryClient } }) => {
++    const user = await queryClient.ensureQueryData({ queryKey: ["me"], queryFn: getMeApi });
++    if (!user.permissions.includes(TELEGRAM_PERMISSION)) {
++      throw redirect({ to: "/403" });
++    }
++  },
++  // Пусто намеренно: сам раздел — TelegramPanel в _auth-layout (routes/_auth.tsx),
++  // он переживает уход на другие страницы, чтобы iframe клиента не перезагружался.
++  component: () => null,
++});
+diff --git a/scripts/tg_patch.py b/scripts/tg_patch.py
+new file mode 100644
+index 0000000..32cd452
+--- /dev/null
++++ b/scripts/tg_patch.py
+@@ -0,0 +1,83 @@
++# -*- coding: utf-8 -*-
++"""
++Подготовка Telegram Web K (https://github.com/morethanwords/tweb) для раздела
++«Telegram» в Meridian (backend/app/routers/telegram.py, docs/telegram.md).
++
++    python scripts/tg_patch.py build <папка сборки> — скопировать сборку в
++                                            frontend/public/tg/ и перенаправить
++                                            адреса DC на /tgws/
++    python scripts/tg_patch.py src <корень tweb>    — то же в исходнике
++                                            src/lib/mtproto/dcConfigurator.ts
++                                            (перед `pnpm build`)
++
++Папка сборки — dist/ после `pnpm build` либо public/ репозитория (там лежит
++официальная готовая сборка). Хост берётся из location во время работы:
++    wss://kws2.web.telegram.org/apiws  -> wss://<location.host>/tgws/kws2/apiws
++    https://venus.web.telegram.org/apiw1 -> https://<location.host>/tgws/venus/apiw1
++Если шаблон не найден ни разу — ошибка: значит, tweb поменял код и патч надо
++обновить, иначе клиент молча пойдёт напрямую в Telegram.
++"""
++from __future__ import annotations
++
++import re
++import shutil
++import sys
++from pathlib import Path
++
++DEST = Path(__file__).resolve().parent.parent / "frontend" / "public" / "tg"
++
++# `wss://${App.suffix.toLowerCase()}ws${dcId}${suffix}.web.telegram.org/${path}`
++# (в минифицированной сборке — те же шаблонные строки с короткими именами)
++WS_RE = re.compile(r"`wss://\$\{([\w$.]+\.suffix\.toLowerCase\(\))\}ws\$\{([\w$]+)\}\$\{([\w$]+)\}"
++                   r"\.web\.telegram\.org/\$\{([\w$]+)\}`")
++WS_SUB = r"`wss://${globalThis.location.host}/tgws/${\1}ws${\2}${\3}/${\4}`"
++# 'https://' + subdomain + '.web.telegram.org/' + path   (кавычки ' или `)
++HTTP_RE = re.compile(r"([`'])https://\1\s*\+\s*([\w$]+)\s*\+\s*([`'])\.web\.telegram\.org/\3")
++HTTP_SUB = r"\1https://\1+globalThis.location.host+\1/tgws/\1+\2+\1/\1"
++
++
++def patch_text(text: str) -> tuple[str, int, int]:
++    text, n_ws = WS_RE.subn(WS_SUB, text)
++    text, n_http = HTTP_RE.subn(HTTP_SUB, text)
++    return text, n_ws, n_http
++
++
++def patch_files(files) -> None:
++    total_ws = total_http = 0
++    for f in files:
++        text = f.read_text(encoding="utf-8", errors="surrogateescape")
++        if ".web.telegram.org/" not in text:
++            continue
++        new, n_ws, n_http = patch_text(text)
++        if n_ws or n_http:
++            f.write_text(new, encoding="utf-8", errors="surrogateescape", newline="")
++            print(f"  {f.name}: websocket {n_ws}, https {n_http}")
++        total_ws += n_ws
++        total_http += n_http
++    if not total_ws or not total_http:
++        sys.exit(f"ОШИБКА: заменено websocket={total_ws}, https={total_http} — "
++                 "шаблон адресов DC в tweb изменился, обновите регулярки в tg_patch.py")
++
++
++def cmd_build(src: Path) -> None:
++    if not (src / "index.html").is_file():
++        sys.exit(f"нет {src / 'index.html'} — это не папка сборки tweb")
++    if DEST.exists():
++        shutil.rmtree(DEST)
++    # .map не нужны для работы и занимают ~30 МБ; snapshot.html — служебная страница
++    shutil.copytree(src, DEST, ignore=shutil.ignore_patterns("*.map", "snapshot.html"))
++    print(f"скопировано в {DEST}")
++    patch_files(DEST.rglob("*.js"))
++
++
++def cmd_src(root: Path) -> None:
++    f = root / "src" / "lib" / "mtproto" / "dcConfigurator.ts"
++    if not f.is_file():
++        sys.exit(f"нет {f}")
++    patch_files([f])
++
++
++if __name__ == "__main__":
++    if len(sys.argv) != 3 or sys.argv[1] not in ("build", "src"):
++        sys.exit(__doc__)
++    (cmd_build if sys.argv[1] == "build" else cmd_src)(Path(sys.argv[2]))

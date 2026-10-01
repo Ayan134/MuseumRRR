@@ -1,0 +1,25 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+celery[redis]>=5.4.0
+redis>=5.2.0
+psycopg2-binary>=2.9.0
+sqlalchemy>=2.0.0,<2.1  # 2.1 сменил драйвер по умолчанию для postgresql:// на psycopg3 — у нас psycopg2
+alembic>=1.14.0
+pydantic-settings>=2.0.0
+python-multipart>=0.0.20
+bcrypt>=4.0.0,<5.0.0
+python-jose[cryptography]>=3.3.0
+pydantic[email]>=2.0.0
+requests>=2.32.0
+minio>=7.2.0
+openpyxl>=3.1.0
+numpy>=1.24
+prometheus-client>=0.21.0
+slowapi>=0.1.9
+httpx>=0.27.0
+tenacity>=8.2.0
+holidays>=0.60,<1.0
+tzdata>=2024.1
+# Прокси Telegram во вкладке (routers/telegram.py): клиент WebSocket до *.web.telegram.org.
+# uvicorn[standard] тоже его тянет, но версию >=15 (подхват HTTPS_PROXY) фиксируем явно.
+websockets>=15
